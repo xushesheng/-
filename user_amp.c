@@ -105,6 +105,9 @@ static int amp_fd = -1;
 static int tun_fd = -1;
 static uint32_t remote_pc_addr = 0; /* network byte order */
 
+/********
+用来读取分包时读取两个字节长度
+*********/
 static inline uint16_t read_be16_unaligned(const uint8_t *p)
 {
     uint16_t v;
@@ -280,8 +283,8 @@ static void batch_reset(batch_state_t *b)
 
 static int batch_append(batch_state_t *b, const uint8_t *pkt, size_t pkt_len, uint32_t dst_ip)
 {
-    if (pkt_len > 0xFFFF) return -1;
-    if (b->len + 2 + pkt_len > AMP_BATCH_MAX_BYTES) return -2;
+    if (pkt_len > 0xFFFF) return -1;                                                        //如果长度超长返回-1
+    if (b->len + 2 + pkt_len > AMP_BATCH_MAX_BYTES) return -2;                              //如果核算长度超出640B返回-2
 
     if (b->count == 0)
         b->dst_ip = dst_ip;
@@ -469,9 +472,9 @@ static void *tun_to_amp_thread(void *arg)
                 /* 空间不足：先 flush 再试一次；若还是不行就单包直发 */
                 (void)amp_flush_batch_if_any(&batch);
                 rc = batch_append(&batch, buf, pkt_len, dst_ip);                            //再次添加
-                if (rc != 0)
-                    (void)amp_send_msg(dst_ip, buf, pkt_len);
-            } else if (rc != 0) {
+                if (rc != 0)                                                                //如果再次添加失败
+                    (void)amp_send_msg(dst_ip, buf, pkt_len);                               //则单独发送一次当前IP包
+            }else if (rc != 0) {
                 (void)amp_flush_batch_if_any(&batch);
                 (void)amp_send_msg(dst_ip, buf, pkt_len);
             }
@@ -508,6 +511,7 @@ static void *amp_to_tun_thread(void *arg)
 
     while (1) {
         ssize_t n = read(amp_fd, &msg, sizeof(msg));
+		/*********读到数据后过滤一遍下列条件**********/
         if (n < 0) {
             if (errno == EINTR) continue;
             perror("read(amp)");
@@ -522,22 +526,23 @@ static void *amp_to_tun_thread(void *arg)
         /* 兼容：
          * - AMPB：拆包写回 TUN
          * - 否则：按单个原始 IP 包写回 TUN */
+		//判断如果是 AMPB 批帧
         if (msg.len >= sizeof(amp_batch_hdr_t) && memcmp(msg.data, AMP_BATCH_MAGIC, 4) == 0) {
-            const amp_batch_hdr_t *hdr = (const amp_batch_hdr_t *)msg.data;
-            if (hdr->version != AMP_BATCH_VERSION)
+            const amp_batch_hdr_t *hdr = (const amp_batch_hdr_t *)msg.data;                 //把数据头指向批帧头准备解析
+            if (hdr->version != AMP_BATCH_VERSION)                                          //判断hdr版本
                 continue;
 
-            uint16_t count = ntohs(hdr->count_be);
-            size_t off = sizeof(amp_batch_hdr_t);
-            for (uint16_t i = 0; i < count; i++) {
-                if (off + 2 > msg.len)
+            uint16_t count = ntohs(hdr->count_be);                                          //网络序子包数量转换成主机序子包数量count
+            size_t off = sizeof(amp_batch_hdr_t);                                           //定义off赋值为聚合帧头长度
+            for (uint16_t i = 0; i < count; i++) {                                          //循环取子帧
+                if (off + 2 > msg.len)                                                      //如果聚合帧头长度off加上2字节长度超过了msg长度则退出循环(防越界)
                     break;
-                uint16_t l = read_be16_unaligned(msg.data + off);
-                off += 2;
-                if (off + l > msg.len)
+                uint16_t l = read_be16_unaligned(msg.data + off);                           //定义l赋值为这一子帧长度（从msg.data + off地址往后读2个字节）
+                off += 2;                                                                   //把读指针往后挪 2 个字节：跳过刚才读掉的长度字段，指向真正的包内容起始
+                if (off + l > msg.len)                                                      //检查：缓冲区里剩下的字节是否足够放下一个完整子包
                     break;
-                (void)tun_write_packet(tun_fd, msg.data + off, l);
-                off += l;
+                (void)tun_write_packet(tun_fd, msg.data + off, l);                          //写会tun    
+                off += l;                                                                   //读指针再往后挪 l 字节，跳过刚刚处理完的子包内容，指向下一个 len 字段
             }
         } else {
             (void)tun_write_packet(tun_fd, msg.data, msg.len);
